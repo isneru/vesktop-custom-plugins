@@ -17,11 +17,27 @@ const ServerPrev = keybind("mod+alt+up");
 
 const STEP = 60;
 
-const CLICKABLE = [
-    "a[href]", "button", "input", "textarea", "select", "[contenteditable='true']", "[tabindex]:not([tabindex='-1'])",
+const SEMANTIC = [
+    "a[href]", "button", "input", "textarea", "select", "[contenteditable='true']",
     ...["button", "link", "tab", "treeitem", "option", "menuitem", "menuitemcheckbox", "menuitemradio", "checkbox", "radio", "switch"]
         .map(role => `[role='${role}']`),
 ].join(", ");
+
+const HANDLERS = ["onClick", "onMouseDown", "onMouseUp", "onPointerDown", "onPointerUp"];
+
+function reactProps(el: Element): Record<string, unknown> | undefined {
+    for (const key in el) if (key.startsWith("__reactProps$")) return (el as any)[key];
+}
+
+// Much of Discord is clickable only through a React handler on a plain div
+// (the account panel, member list rows, avatars), so roles alone miss them.
+// A message has an onClick of its own that does nothing visible.
+const isClickable = (el: Element) =>
+    el.matches(SEMANTIC) || (!el.matches("[role='article']") && HANDLERS.some(h => typeof reactProps(el)?.[h] === "function"));
+
+function clickTarget(el: Element | null) {
+    for (; el; el = el.parentElement) if (isClickable(el)) return el;
+}
 
 const isText = (el: Element | null): el is HTMLElement =>
     el instanceof HTMLElement && (el.isContentEditable || el.matches("textarea, select, input:not([type='checkbox'], [type='radio'])"));
@@ -39,30 +55,38 @@ function scroll(top: (el: Element) => number) {
     if (el) el.scrollTop = top(el);
 }
 
-let hints: { overlay: HTMLElement; typed: string; labels: { el: HTMLElement; label: string; span: HTMLElement; }[]; } | null = null;
+type Target = { el: HTMLElement; x: number; y: number; left: number; top: number; };
+
+let hints: { overlay: HTMLElement; typed: string; labels: (Target & { label: string; span: HTMLElement; })[]; } | null = null;
 
 function showHints() {
-    // An element is hinted only if it is what a click on its centre would hit,
-    // which drops covered elements and keeps the innermost of nested ones.
-    const targets = [...document.querySelectorAll<HTMLElement>(CLICKABLE)].filter(el => {
+    // An element is hinted only if it is what a click on the centre of its
+    // visible part would hit, which drops covered elements and keeps the
+    // innermost of nested ones.
+    const targets: Target[] = [];
+    for (const el of document.body.querySelectorAll<HTMLElement>("*")) {
+        if (!isClickable(el)) continue;
         const r = el.getBoundingClientRect();
-        return r.width && r.height && document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)?.closest(CLICKABLE) === el;
-    });
+        const left = Math.max(r.left, 0), top = Math.max(r.top, 0);
+        const right = Math.min(r.right, innerWidth), bottom = Math.min(r.bottom, innerHeight);
+        if (right - left < 1 || bottom - top < 1) continue;
+        const x = (left + right) / 2, y = (top + bottom) / 2;
+        if (clickTarget(document.elementFromPoint(x, y)) === el) targets.push({ el, x, y, left, top });
+    }
     if (!targets.length) return;
 
     const width = String(targets.length).length;
     const overlay = document.createElement("div");
     overlay.className = "vim-nav-hints";
-    const labels = targets.map((el, i) => {
-        const r = el.getBoundingClientRect();
+    const labels = targets.map((target, i) => {
         const label = String(i + 1).padStart(width, "0");
         const span = document.createElement("span");
         span.className = "vim-nav-hint";
-        span.style.left = `${r.left}px`;
-        span.style.top = `${r.top}px`;
+        span.style.left = `${target.left}px`;
+        span.style.top = `${target.top}px`;
         span.textContent = label;
         overlay.append(span);
-        return { el, label, span };
+        return { ...target, label, span };
     });
     document.body.append(overlay);
     hints = { overlay, typed: "", labels };
@@ -73,10 +97,29 @@ function hideHints() {
     hints = null;
 }
 
-function activate(el: HTMLElement) {
+// Discord focuses the message box once a channel has loaded (measured ~320ms
+// after the switch), which would send every following key into the draft.
+// After a switch made from here that focus is undone, until the next input
+// that could mean to type: a mouse press, `i`, or a key this plugin ignores.
+let keepNormal = false;
+
+// Blurring inside focusin runs before React's own onFocus for the box, which
+// leaves Discord's text area half mounted and crashes the next channel switch;
+// a task later it is an ordinary blur, as if the box had been clicked away from.
+function onFocusIn({ target }: FocusEvent) {
+    if (keepNormal && target instanceof HTMLElement && target.matches("form [role='textbox']")) setTimeout(() => target.blur());
+}
+
+function onMouseDown(e: MouseEvent) {
+    if (!e.isTrusted) return;
+    hideHints();
+    keepNormal = false;
+}
+
+function activate({ el, x, y }: Target) {
+    keepNormal = !isText(el);
     if (isText(el)) return el.focus();
-    const r = el.getBoundingClientRect();
-    const init = { bubbles: true, cancelable: true, view: window, button: 0, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    const init = { bubbles: true, cancelable: true, view: window, button: 0, clientX: x, clientY: y };
     el.dispatchEvent(new PointerEvent("pointerdown", init));
     el.dispatchEvent(new MouseEvent("mousedown", init));
     el.dispatchEvent(new PointerEvent("pointerup", init));
@@ -93,7 +136,7 @@ function hintKey(e: KeyboardEvent, h: NonNullable<typeof hints>) {
 
     if (matches.length === 1) {
         hideHints();
-        return activate(matches[0].el);
+        return activate(matches[0]);
     }
 
     h.typed = typed;
@@ -130,7 +173,11 @@ function onKeyDown(e: KeyboardEvent) {
         e.stopImmediatePropagation();
         return hintKey(e, hints);
     }
-    if (e.ctrlKey || e.altKey || e.metaKey || e.isComposing) return;
+    if (["Shift", "Control", "Alt", "Meta"].includes(e.key)) return;
+    if (e.ctrlKey || e.altKey || e.metaKey || e.isComposing) {
+        keepNormal = false;
+        return;
+    }
 
     const active = document.activeElement;
     if (isText(active)) {
@@ -144,9 +191,15 @@ function onKeyDown(e: KeyboardEvent) {
     if (!isPrefix(seq)) seq = e.key;
     pending = "";
 
-    if (keys[seq]) keys[seq](e);
-    else if (isPrefix(seq)) pending = seq;
-    else return;
+    if (keys[seq]) {
+        if (seq === "i") keepNormal = false;
+        else if (["J", "K", "H", "L"].includes(seq)) keepNormal = true;
+        keys[seq](e);
+    } else if (isPrefix(seq)) pending = seq;
+    else {
+        if (e.key !== "Escape") keepNormal = false;
+        return;
+    }
 
     // Capture on window runs before Discord's document-level keybinds,
     // including the one that sends any typed character to the message box.
@@ -162,14 +215,17 @@ export default definePlugin({
     start() {
         enableStyle(style);
         window.addEventListener("keydown", onKeyDown, true);
-        window.addEventListener("mousedown", hideHints, true);
+        window.addEventListener("mousedown", onMouseDown, true);
+        window.addEventListener("focusin", onFocusIn, true);
     },
 
     stop() {
         window.removeEventListener("keydown", onKeyDown, true);
-        window.removeEventListener("mousedown", hideHints, true);
+        window.removeEventListener("mousedown", onMouseDown, true);
+        window.removeEventListener("focusin", onFocusIn, true);
         hideHints();
         pending = "";
+        keepNormal = false;
         disableStyle(style);
     },
 });
